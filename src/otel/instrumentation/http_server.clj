@@ -54,6 +54,14 @@
   physical machine identity never reaches stored telemetry or screenshots."
   :otel.instrumentation.http-server/capture-network-addresses?)
 
+(def propagator-option
+  "jolt-http option naming the inbound TextMapPropagator. When absent, the
+  standard Trace Context plus baggage composite is used. An explicit invalid
+  value, or a configured propagator that throws, fails closed to a root
+  context: the HTTP request still runs and receives a fresh server span, but
+  untrusted propagation headers are not inherited."
+  :otel.instrumentation.http-server/propagator)
+
 (def on-end-option
   "jolt-http option naming a zero-argument completion hook. The provider calls
   it exactly once after the accepted response callback has ended the server
@@ -202,12 +210,23 @@
       (try (on-end)
            (catch :default _ nil)))))
 
+(defn- extracted-parent [opts headers]
+  (let [configured? (contains? opts propagator-option)
+        propagator (if configured?
+                     (get opts propagator-option)
+                     propagation/default-propagator)]
+    (if (satisfies? propagation/TextMapPropagator propagator)
+      (try
+        (propagation/extract propagator context/root headers)
+        (catch :default _ context/root))
+      context/root)))
+
 (defn- traced-handler [handler request opts]
   (let [{:keys [method span-name]} (method-values request)
         route        (resolved-route opts request)
         capture-addresses? (not (false? (get opts network-addresses-option)))
         span-name    (if route (str span-name " " route) span-name)
-        parent       (propagation/extract-context (or (:headers request) {}))
+        parent       (extracted-parent opts (or (:headers request) {}))
         tracer       (sdk/tracer scope-name {:version instrumentation-version})
         span         (trace/start-span tracer span-name
                                        {:parent parent

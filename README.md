@@ -30,6 +30,20 @@ authorization/cookie headers, or arbitrary header values.
 Exception events retain a bounded type and escaped flag, not exception messages
 or ex-data.
 
+The default inbound propagator is the standard Trace Context plus baggage
+composite. Applications with a stricter boundary can supply any
+`otel.propagation/TextMapPropagator`; for example, this accepts distributed
+trace parentage and tracestate without accepting baggage:
+
+```clojure
+(http/run-server handler
+  :otel.instrumentation.http-server/propagator
+  otel.propagation/trace-context)
+```
+
+An explicitly invalid propagator, or one that throws while parsing untrusted
+headers, fails closed to a fresh root span without changing the HTTP result.
+
 Methods in the semantic-conventions registry retain their standard value.
 Other methods use `_OTHER` and the span name `HTTP`. jolt-http currently
 normalizes request-line methods before constructing the Ring map, so this

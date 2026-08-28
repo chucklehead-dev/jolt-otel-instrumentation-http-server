@@ -6,6 +6,7 @@
             [otel.context :as context]
             [otel.exporter.memory :as memory]
             [otel.instrumentation.http-server :as instrumentation]
+            [otel.propagation :as propagation]
             [otel.sdk :as sdk]
             [otel.trace :as trace]))
 
@@ -139,6 +140,73 @@
               (fn [] (throw (ex-info "observer failed" {})))})]
         (is (identical? callback-result observed))
         (is (= 1 (count (memory/spans exporter))))))))
+
+(deftest configured-propagator-controls-inbound-context
+  (with-memory-sdk
+    (fn [exporter]
+      (let [baggage-values (atom [])
+            respond (fn [response _]
+                      (observe-safe-response! response))
+            handler (fn [_ respond _]
+                      (swap! baggage-values conj
+                             (baggage/get-value (baggage/current) "tenant"))
+                      (respond {:status 200 :headers {} :body nil} false))]
+        (apply-advice
+         handler
+         (request {:headers {"traceparent"
+                             (str "00-" remote-trace-id "-"
+                                  remote-span-id "-01")
+                             "tracestate" "vendor=one"
+                             "baggage" "tenant=private"}})
+         respond
+         (fn [_] nil)
+         {instrumentation/propagator-option propagation/trace-context})
+        (apply-advice
+         handler
+         (request {:headers {"traceparent"
+                             (str "00-" remote-trace-id "-"
+                                  remote-span-id "-01")
+                             "baggage" "tenant=private"}})
+         respond
+         (fn [_] nil)
+         {instrumentation/propagator-option :not-a-propagator})
+        (let [[configured invalid] (memory/spans exporter)]
+          (is (= [nil nil] @baggage-values)
+              "trace-only and invalid configurations do not inherit baggage")
+          (is (= remote-trace-id
+                 (get-in configured [:span-context :trace-id])))
+          (is (= remote-span-id (:parent-span-id configured)))
+          (is (= [["vendor" "one"]]
+                 (get-in configured [:span-context :trace-state])))
+          (is (nil? (:parent-span-id invalid)))
+          (is (not= remote-trace-id
+                    (get-in invalid [:span-context :trace-id]))))))))
+
+(deftest throwing-propagator-fails-closed-without-breaking-the-request
+  (with-memory-sdk
+    (fn [exporter]
+      (let [throwing
+            (reify propagation/TextMapPropagator
+              (fields [_] [])
+              (inject [_ _ carrier] carrier)
+              (extract [_ _ _]
+                (throw (ex-info "untrusted propagator failed" {}))))
+            callback-result (Object.)
+            observed
+            (apply-advice
+             (fn [_ respond _]
+               (respond {:status 204 :headers {} :body nil} false))
+             (request)
+             (fn [response _]
+               (observe-safe-response! response)
+               callback-result)
+             (fn [_] nil)
+             {instrumentation/propagator-option throwing})
+            [span] (memory/spans exporter)]
+        (is (identical? callback-result observed))
+        (is (nil? (:parent-span-id span)))
+        (is (not= remote-trace-id
+                  (get-in span [:span-context :trace-id])))))))
 
 (deftest async-return-does-not-end-span-and-callback-restores-parent
   (with-memory-sdk

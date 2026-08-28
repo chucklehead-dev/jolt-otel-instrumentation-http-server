@@ -1,6 +1,8 @@
 (ns otel.instrumentation.http-server-build-smoke
   (:require [jolt.http.server :as http]
+            [otel.baggage :as baggage]
             [otel.exporter.memory :as memory]
+            [otel.propagation :as propagation]
             [otel.sdk :as sdk]
             [otel.trace :as trace]
             [teensyp.ffi-net :as net]))
@@ -29,14 +31,20 @@
                                :processor :simple
                                :metrics? false})
         child-tracer (sdk/tracer "http-server-weave-child")
+        observed-baggage (promise)
         handler (fn [_request respond _raise]
+                  (deliver observed-baggage
+                           (baggage/get-value (baggage/current) "tenant"))
                   (deliver entered true)
                   (future
                     @release
                     (trace/with-span [_ child-tracer "async-work"])
                     (respond {:status 202 :headers {} :body "woven"}))
                   :returned)
-        server (http/run-server handler :async? true :port 0 :reuse-address? true)
+        server (http/run-server
+                handler :async? true :port 0 :reuse-address? true
+                :otel.instrumentation.http-server/propagator
+                propagation/trace-context)
         fd (net/connect-loopback (:port server))]
     (try
       (net/client-send-all
@@ -44,6 +52,8 @@
        (utf8 (str "GET /woven HTTP/1.1\r\n"
                   "Host: localhost\r\n"
                   "traceparent: 00-" remote-trace-id "-" remote-span-id "-01\r\n"
+                  "tracestate: vendor=one\r\n"
+                  "baggage: tenant=private\r\n"
                   "Connection: close\r\n\r\n")))
       @entered
       (ensure! (empty? (memory/spans exporter))
@@ -81,6 +91,13 @@
             (ensure! (= remote-span-id (:parent-span-id server-span))
                      "woven server span has the wrong remote parent"
                      {:span server-span})
+            (ensure! (= [["vendor" "one"]]
+                        (get-in server-span [:span-context :trace-state]))
+                     "woven server span lost ordered tracestate"
+                     {:span server-span})
+            (ensure! (nil? @observed-baggage)
+                     "trace-only server configuration inherited baggage"
+                     {:baggage @observed-baggage})
             (ensure! (= (get-in server-span [:span-context :span-id])
                         (:parent-span-id child-span))
                      "async child was not parented to the woven server span"
