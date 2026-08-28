@@ -1,0 +1,18 @@
+{:paths ["src"]
+
+ :deps {io.github.casselc/jolt-http
+        {:git/url "https://github.com/casselc/jolt-http.git"
+         :git/sha "7737097ba00987f9f851e6527da17ea68b0d5c4f"}
+        io.github.casselc/otel
+        {:git/url "https://github.com/casselc/otel.git"
+         :git/sha "cac3cbcf1e7101c0a893c3aaffa5a3154c0f766b"}}
+
+ :jolt/build
+ {:aspects [{:resource "META-INF/jolt/aspects/http-server.edn"
+             :provider otel.instrumentation.http-server}]
+  :aspect-report "target/http-server-aspects.edn"}
+
+ :aliases {:test {:extra-paths ["test"]
+                  :main-opts ["-m" "otel.instrumentation.http-server-test-runner"]}}
+
+ :tasks {test "jolt -M:test"}}

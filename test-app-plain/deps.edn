@@ -1,0 +1,4 @@
+{:paths ["../test"]
+
+ :deps {io.github.chucklehead-dev/jolt-otel-instrumentation-http-server
+        {:local/root ".."}}}
