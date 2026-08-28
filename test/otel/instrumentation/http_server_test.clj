@@ -73,8 +73,10 @@
       (let [response {:status 201 :headers {} :body "private response"}
             callback-result (Object.)
             baggage-value (atom nil)
+            active-values (atom [])
             observed (apply-advice
                       (fn [_ respond _]
+                        (swap! active-values conj (instrumentation/active?))
                         (reset! baggage-value
                                 (baggage/get-value (baggage/current) "tenant"))
                         (respond response false))
@@ -84,6 +86,7 @@
                                       remote-span-id "-01")
                                  "baggage" "tenant=blue"}})
                       (fn [actual async?]
+                        (swap! active-values conj (instrumentation/active?))
                         (is (identical? response actual))
                         (is (false? async?))
                         (observe-safe-response! actual)
@@ -99,6 +102,10 @@
         (is (= remote-trace-id (get-in span [:span-context :trace-id])))
         (is (= remote-span-id (:parent-span-id span)))
         (is (= "blue" @baggage-value))
+        (is (= [true true] @active-values)
+            "the request-scoped marker covers dispatch and response completion")
+        (is (false? (instrumentation/active?))
+            "the marker does not leak outside the request")
         (is (= "GET" (get attrs "http.request.method")))
         (is (= "/orders/:order-id" (get attrs "http.route")))
         (is (= "/orders/42" (get attrs "url.path")))

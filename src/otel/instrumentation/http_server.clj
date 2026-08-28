@@ -21,6 +21,20 @@
 (def ^:private instrumentation-version "0.1.0")
 (def ^:private scope-name
   "io.github.chucklehead-dev/jolt-otel-instrumentation-http-server")
+(def ^:private active-context-key
+  ::active-request)
+
+(defn active?
+  "True while application code or a response callback runs inside this
+  provider's generic server boundary.
+
+  Embedders can use this request-scoped capability marker to retain explicit
+  source-mode fallback instrumentation without duplicating compiler-woven
+  server or client spans. It carries with the OTel context and never becomes
+  process-global build state."
+  []
+  (true? (context/get-value (context/current) active-context-key)))
+
 (def exclusion-option
   "jolt-http option naming a `(fn [request] boolean)` predicate. Matching
   requests bypass server instrumentation before trace headers are extracted.
@@ -185,7 +199,9 @@
                                         :attributes
                                         (request-attributes request method route
                                                             capture-addresses?)})
-        span-context (trace/context-with-span parent span)
+        span-context (-> parent
+                         (trace/context-with-span span)
+                         (context/with-value active-context-key true))
         ended?       (atom false)
         terminal-lock (Object.)
         terminal!
