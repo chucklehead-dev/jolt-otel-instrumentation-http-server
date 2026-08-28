@@ -25,10 +25,15 @@ Transport-delivery instrumentation needs an outcome-bearing final-write seam in
 jolt-tcp and is outside this manifest's contract.
 
 The provider records method, path, protocol version, server/client address and
-response status. It does not record query strings, request or response bodies,
-authorization/cookie headers, or arbitrary header values.
-Exception events retain a bounded type and escaped flag, not exception messages
-or ex-data.
+response status. It also records the stable `http.server.request.duration`
+histogram in seconds with the standard advisory buckets; its duration ends at
+the same accepted Ring response-callback boundary as the span. It does not
+record query strings, request or response bodies, authorization/cookie headers,
+or arbitrary header values. The duration metric defaults to the required and
+recommended low-cardinality dimensions; the span-only server/client/peer
+addresses do not become metric dimensions. Failures emit a correlated
+`http.server.request.exception` log event at ERROR severity with only the
+bounded exception type, not exception messages, stack traces, or ex-data.
 
 The default inbound propagator is the standard Trace Context plus baggage
 composite. Applications with a stricter boundary can supply any
@@ -48,6 +53,8 @@ Methods in the semantic-conventions registry retain their standard value.
 Other methods use `_OTHER` and the span name `HTTP`. jolt-http currently
 normalizes request-line methods before constructing the Ring map, so this
 consumer does not fabricate `http.request.method_original` from a lossy value.
+The standard `OTEL_INSTRUMENTATION_HTTP_KNOWN_METHODS` comma-separated setting
+provides the required case-sensitive full override for extension methods.
 
 Embedded receivers and viewers should prevent self-observation before handler
 dispatch by supplying an exclusion predicate to jolt-http:
@@ -97,14 +104,19 @@ HTTP. The plain fixture has the provider and inert manifest on its classpath but
 does not select it; only its explicit child span is exported.
 
 ```sh
-jolt -M:test
+env JOLT_GITLIBS_DIR=/home/chuck/.cache/jolt-http-server-gitlibs \
+  /home/chuck/ai-src/tools/jolt-with-chez-10.4.1 jolt -M:test
 
-jolt -A:test build -m otel.instrumentation.http-server-build-smoke \
+env JOLT_GITLIBS_DIR=/home/chuck/.cache/jolt-http-server-gitlibs \
+  /home/chuck/ai-src/tools/jolt-with-chez-10.4.1 jolt \
+  -A:test build -m otel.instrumentation.http-server-build-smoke \
   -o target/http-server-build-smoke
 target/http-server-build-smoke
 
 (cd test-app-plain && \
-  jolt build -m otel.instrumentation.http-server-build-smoke \
+  env JOLT_GITLIBS_DIR=/home/chuck/.cache/jolt-http-server-gitlibs \
+  /home/chuck/ai-src/tools/jolt-with-chez-10.4.1 jolt \
+  build -m otel.instrumentation.http-server-build-smoke \
     -o target/plain-http-server-smoke)
 test-app-plain/target/plain-http-server-smoke plain
 ```

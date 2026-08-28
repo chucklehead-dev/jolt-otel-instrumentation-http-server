@@ -46,11 +46,13 @@
    (response-join-point) [response] (fn [] [response nil])))
 
 (defn- with-memory-sdk [f]
-  (let [exporter (memory/exporter)
+  (let [exporter (memory/multisignal-exporter)
         handle (sdk/init! {:service-name "http-server-instrumentation-test"
                            :exporter exporter
                            :processor :simple
-                           :metrics? false})]
+                           :runtime-metrics? false
+                           :logs? true
+                           :bridge-logging? false})]
     (try
       (f exporter)
       (finally (sdk/shutdown! handle)))))
@@ -119,6 +121,7 @@
         (is (= "/orders/:order-id" (get attrs "http.route")))
         (is (= "/orders/42" (get attrs "url.path")))
         (is (= "1.1" (get attrs "network.protocol.version")))
+        (is (= "192.0.2.10" (get attrs "network.peer.address")))
         (is (= 201 (get attrs "http.response.status_code")))
         (is (not (.contains (pr-str span) "private response")))
         (is (not (.contains (pr-str span) "tenant=blue")))))))
@@ -319,8 +322,90 @@
         (is (= 2 (count spans)))
         (is (every? #(= :error (get-in % [:status :code])) spans))
         (is (every? #(some? (get (:attributes %) "error.type")) spans))
+        (let [events (memory/records exporter)]
+          (is (= 2 (count events)))
+          (is (every? #(= "http.server.request.exception" (:event-name %))
+                      events))
+          (is (every? #(= 17 (:severity-number %)) events))
+          (is (every? #(some? (get (:attributes %) "exception.type"))
+                      events))
+          (is (every? (fn [[span event]]
+                        (and (= (get-in span [:span-context :trace-id])
+                                (:trace-id event))
+                             (= (get-in span [:span-context :span-id])
+                                (:span-id event))))
+                      (map vector spans events))
+              "each exception log is correlated to its server span"))
         (doseq [secret ["private raised message" "private thrown message"]]
-          (is (not (.contains (pr-str spans) secret))))))))
+          (is (not (.contains (pr-str [spans (memory/records exporter)])
+                              secret))))))))
+
+(deftest exception-error-type-agrees-across-span-log-and-duration-metric
+  (let [exporter (memory/multisignal-exporter)
+        handle (sdk/init! {:service-name "http-server-error-signals-test"
+                           :exporter exporter :processor :simple
+                           :runtime-metrics? false :logs? true
+                           :bridge-logging? false})]
+    (try
+      (let [raised (ex-info "private metric error" {:secret true})]
+        (is (identical?
+             raised
+             (apply-advice
+              (fn [_ _ raise] (raise raised))
+              (request {:headers {}})
+              (fn [_ _] nil)
+              (fn [error] error))))
+        (is (sdk/force-flush! handle))
+        (let [[span] (memory/spans exporter)
+              [event] (memory/records exporter)
+              metric (first
+                      (filter #(= "http.server.request.duration" (:name %))
+                              (memory/metrics exporter)))
+              point (first (:data-points metric))
+              error-type (get (:attributes span) "error.type")]
+          (is (some? error-type))
+          (is (= error-type (get (:attributes event) "exception.type")))
+          (is (= error-type (get (:attributes point) "error.type")))
+          (is (= (get-in span [:span-context :trace-id]) (:trace-id event)))
+          (is (= (get-in span [:span-context :span-id]) (:span-id event)))
+          (is (not (.contains (pr-str [span event point])
+                              "private metric error")))))
+      (finally
+        (sdk/shutdown! handle)))))
+
+(deftest duration-metric-uses-stable-name-unit-buckets-and-attributes
+  (let [exporter (memory/multisignal-exporter)
+        handle (sdk/init! {:service-name "http-server-metric-test"
+                           :exporter exporter :processor :simple
+                           :runtime-metrics? false :logs? true
+                           :bridge-logging? false})]
+    (try
+      (apply-advice
+       (fn [_ respond _] (respond {:status 201 :headers {} :body nil} false))
+       (request {:headers {}})
+       (fn [response _] (observe-safe-response! response))
+       (fn [_] nil)
+       {instrumentation/route-option (fn [_] "/orders/:id")})
+      (is (sdk/force-flush! handle))
+      (let [metric (first (filter #(= "http.server.request.duration" (:name %))
+                                  (memory/metrics exporter)))
+            point (first (:data-points metric))]
+        (is (= "s" (:unit metric)))
+        (is (= [0.005 0.01 0.025 0.05 0.075 0.1 0.25 0.5 0.75
+                1.0 2.5 5.0 7.5 10.0]
+               (:explicit-bounds metric)))
+        (is (= "GET" (get (:attributes point) "http.request.method")))
+        (is (= "http" (get (:attributes point) "url.scheme")))
+        (is (= "/orders/:id" (get (:attributes point) "http.route")))
+        (is (= "1.1" (get (:attributes point) "network.protocol.version")))
+        (is (= 201 (get (:attributes point) "http.response.status_code")))
+        (is (nil? (get (:attributes point) "server.address"))
+            "opt-in server identity is not a default metric dimension")
+        (is (nil? (get (:attributes point) "server.port"))
+            "opt-in server identity is not a default metric dimension")
+        (is (not (neg? (:sum point)))))
+      (finally
+        (sdk/shutdown! handle)))))
 
 (deftest response-observer-reports-the-sanitized-wire-status
   (with-memory-sdk
@@ -357,6 +442,15 @@
         (is (= "_OTHER" (get (:attributes span) "http.request.method")))
         (is (nil? (get (:attributes span) "http.request.method_original")))))))
 
+(deftest known-method-setting-is-a-case-sensitive-full-override
+  (is (contains? (instrumentation/parse-known-methods nil) "GET"))
+  (is (= #{} (instrumentation/parse-known-methods "")))
+  (is (= #{"GET" "PROPFIND" "get"}
+         (instrumentation/parse-known-methods "GET, PROPFIND, get")))
+  (is (= #{"GET"}
+         (instrumentation/parse-known-methods
+          "GET, bad method, TOO_LONG_TO_BE_A_BOUNDED_METHOD_NAME"))))
+
 (deftest suppression-bypasses-extraction-and-handler-replacement
   (with-memory-sdk
     (fn [exporter]
@@ -373,6 +467,22 @@
         (is (= :plain observed))
         (is (nil? @replacement))
         (is (empty? (memory/spans exporter)))))))
+
+(deftest response-observer-is-inert-outside-this-provider-request
+  (with-memory-sdk
+    (fn [exporter]
+      (let [tracer (sdk/tracer "unrelated-owner")]
+        (trace/with-span [_ tracer "unrelated-operation"]
+          (let [response {:status 503 :headers {} :body nil}
+                result (instrumentation/around-response
+                        (response-join-point) [response]
+                        (fn [] [response nil]))]
+            (is (identical? response (first result)))))
+        (let [[span] (memory/spans exporter)]
+          (is (= "unrelated-operation" (:name span)))
+          (is (nil? (get (:attributes span) "http.response.status_code")))
+          (is (nil? (get (:attributes span) "error.type")))
+          (is (= :unset (get-in span [:status :code]))))))))
 
 (deftest request-exclusion-bypasses-receiver-and-viewer-routes
   (with-memory-sdk
@@ -447,6 +557,7 @@
         (is (nil? (get attrs "server.address")))
         (is (nil? (get attrs "server.port")))
         (is (nil? (get attrs "client.address")))
+        (is (nil? (get attrs "network.peer.address")))
         (is (not (.contains (pr-str span) "private-host")))))))
 
 (deftest provider-contract-matches-the-fetched-library-manifest

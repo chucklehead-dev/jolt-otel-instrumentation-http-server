@@ -8,7 +8,10 @@
   and ends it after the first callback finishes. This is Ring response-callback
   completion, not proof that bytes reached the peer."
   (:require [clojure.string :as str]
+            [jolt.host :as host]
             [otel.context :as context]
+            [otel.logs :as logs]
+            [otel.metrics :as metrics]
             [otel.propagation :as propagation]
             [otel.sdk :as sdk]
             [otel.trace :as trace]))
@@ -23,6 +26,11 @@
   "io.github.chucklehead-dev/jolt-otel-instrumentation-http-server")
 (def ^:private active-context-key
   ::active-request)
+(def ^:private metric-attributes-context-key
+  ::metric-attributes)
+(def ^:private duration-boundaries
+  [0.005 0.01 0.025 0.05 0.075 0.1 0.25 0.5 0.75 1.0 2.5 5.0 7.5 10.0])
+(defonce ^:private duration-instrument-cache (atom nil))
 
 (defn active?
   "True while application code or a response callback runs inside this
@@ -72,11 +80,25 @@
   redirect causes the next viewer query."
   :otel.instrumentation.http-server/on-end)
 
-(def ^:private known-methods
+(def ^:private default-known-methods
   ;; Stable HTTP semantic-convention values plus QUERY, which is already in the
   ;; current registry as a development value.
   #{"CONNECT" "DELETE" "GET" "HEAD" "OPTIONS" "PATCH"
     "POST" "PUT" "QUERY" "TRACE"})
+
+(defn parse-known-methods
+  "Parse the standard case-sensitive known-method full override."
+  [raw]
+  (if (string? raw)
+    (into #{}
+          (filter #(and (<= 1 (count %) 32)
+                        (re-matches #"[!#$%&'*+.^_`|~0-9A-Za-z-]+" %)))
+          (map str/trim (str/split raw #",")))
+    default-known-methods))
+
+(def ^:private configured-known-methods
+  (parse-known-methods
+   (host/getenv "OTEL_INSTRUMENTATION_HTTP_KNOWN_METHODS")))
 
 (defn- original-method [request]
   (let [method (:request-method request)]
@@ -87,7 +109,7 @@
 
 (defn- method-values [request]
   (let [original (original-method request)]
-    (if (contains? known-methods original)
+    (if (contains? configured-known-methods original)
       {:method original :span-name original}
       ;; jolt-http's Ring map has already normalized the request-line method to
       ;; a lower-case keyword, so its original spelling/casing is unavailable.
@@ -175,34 +197,72 @@
     (assoc :server.port server-port)
 
     client-address
-    (assoc :client.address client-address))))
+    (assoc :client.address client-address
+           ;; jolt-http exposes the connected peer, not a proxy-derived
+           ;; original address, so these are intentionally equal here.
+           :network.peer.address client-address))))
 
 (defn- exception-type [error]
   (try
     (or (some-> error class .getName) "UnknownExceptionType")
     (catch :default _ "UnknownExceptionType")))
 
-(defn- mark-error! [span error]
+(defn- duration-instrument []
+  (let [provider (sdk/meter-provider)]
+    (if (nil? provider)
+      metrics/noop-instrument
+      (locking duration-instrument-cache
+        (let [cached @duration-instrument-cache]
+          (if (identical? provider (:provider cached))
+            (:instrument cached)
+            (let [instrument
+                  (metrics/histogram
+                   (sdk/meter scope-name {:version instrumentation-version})
+                   "http.server.request.duration"
+                   {:description "Duration of HTTP server requests."
+                    :unit "s"
+                    :boundaries duration-boundaries})]
+              (reset! duration-instrument-cache
+                      {:provider provider :instrument instrument})
+              instrument)))))))
+
+(defn- metric-attributes [attributes]
+  (select-keys attributes
+               [:http.request.method :url.scheme :http.route
+                :network.protocol.version]))
+
+(defn- mark-error! [span metric-attrs error]
   (let [error-type (exception-type error)]
     (trace/set-attribute! span :error.type error-type)
-    ;; Exception messages and ex-data routinely contain request bodies,
-    ;; credentials, filesystem paths, and application data. Preserve only the
-    ;; bounded type and escaped bit.
-    (trace/add-event! span "exception"
-                      {:exception.type error-type
-                       :exception.escaped true})
+    (swap! metric-attrs assoc :error.type error-type)
+    ;; Exception messages, stack traces, and ex-data routinely contain request
+    ;; bodies, credentials, filesystem paths, and application data. The type
+    ;; alone satisfies the event contract without weakening privacy defaults.
+    (logs/emit! (sdk/logger scope-name {:version instrumentation-version})
+                {:event-name "http.server.request.exception"
+                 :body "HTTP server request exception"
+                 :severity :error
+                 :attributes {:exception.type error-type}})
     (trace/set-status! span :error)))
 
 (defn- response-status [response]
   (let [status (:status response)]
     (when (integer? status) status)))
 
-(defn- mark-response! [span response]
+(defn- mark-response! [span metric-attrs response]
   (when-some [status (response-status response)]
-    (trace/set-attribute! span :http.response.status_code status)
-    (when (>= (long status) 500)
-      (trace/set-attribute! span :error.type (str status))
-      (trace/set-status! span :error))))
+    (if (<= 100 status 599)
+      (do
+        (trace/set-attribute! span :http.response.status_code status)
+        (swap! metric-attrs assoc :http.response.status_code status)
+        (when (>= (long status) 500)
+          (trace/set-attribute! span :error.type (str status))
+          (swap! metric-attrs assoc :error.type (str status))
+          (trace/set-status! span :error)))
+      (do
+        (trace/set-attribute! span :error.type "_OTHER")
+        (swap! metric-attrs assoc :error.type "_OTHER")
+        (trace/set-status! span :error)))))
 
 (defn- notify-end! [opts]
   (when-some [on-end (get opts on-end-option)]
@@ -227,16 +287,21 @@
         capture-addresses? (not (false? (get opts network-addresses-option)))
         span-name    (if route (str span-name " " route) span-name)
         parent       (extracted-parent opts (or (:headers request) {}))
+        attributes   (request-attributes request method route capture-addresses?)
+        metric-attrs (atom (metric-attributes attributes))
+        started      (host/mono-nanos)
+        start-wall   (host/wall-nanos)
         tracer       (sdk/tracer scope-name {:version instrumentation-version})
         span         (trace/start-span tracer span-name
                                        {:parent parent
                                         :kind :server
-                                        :attributes
-                                        (request-attributes request method route
-                                                            capture-addresses?)})
+                                        :start-timestamp start-wall
+                                        :attributes attributes})
         span-context (-> parent
                          (trace/context-with-span span)
-                         (context/with-value active-context-key true))
+                         (context/with-value active-context-key true)
+                         (context/with-value metric-attributes-context-key
+                                             metric-attrs))
         ended?       (atom false)
         terminal-lock (Object.)
         terminal!
@@ -255,17 +320,22 @@
                     (success!)
                     result)
                   (catch :default error
-                    (mark-error! span error)
+                    (mark-error! span metric-attrs error)
                     (throw error))
                   (finally
-                    (reset! ended? true)
-                    (trace/end! span)
+                    (let [elapsed (- (host/mono-nanos) started)]
+                      (reset! ended? true)
+                      (trace/end! span (+ start-wall elapsed))
+                      (metrics/record! (duration-instrument)
+                                       (/ elapsed 1000000000.0)
+                                       @metric-attrs))
                     (notify-end! opts)))))))]
     (fn [_request respond raise]
       (let [respond (fn [response async?]
                       (terminal! #(respond response async?) (fn [] nil)))
             raise   (fn [error]
-                      (terminal! #(raise error) #(mark-error! span error)))]
+                      (terminal! #(raise error)
+                                 #(mark-error! span metric-attrs error)))]
         (context/with-context span-context
           (try
             (handler request respond raise)
@@ -290,14 +360,18 @@
   "Observe the result of jolt-http response sanitization while the server span
   is current. The target's `[safe-response problems]` result is returned by
   identity; handler-supplied invalid metadata is never reported as if it went
-  to the wire."
+  to the wire. Outside this provider's request-scoped marker the seam is inert,
+  so an excluded viewer request cannot annotate an unrelated active span."
   [_join-point _evaluated-args proceed]
-  (if (context/instrumentation-suppressed?)
-    (proceed)
-    (let [result (proceed)
-          response (first result)]
-      (mark-response! (trace/current-span) response)
-      result)))
+  (let [instrument? (and (not (context/instrumentation-suppressed?))
+                         (active?))
+        result (proceed)]
+    (when instrument?
+      (when-some [metric-attrs (context/get-value
+                                (context/current)
+                                metric-attributes-context-key)]
+        (mark-response! (trace/current-span) metric-attrs (first result))))
+    result))
 
 (def aspect-provider
   {:schema 1
