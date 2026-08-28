@@ -74,6 +74,7 @@
             callback-result (Object.)
             baggage-value (atom nil)
             active-values (atom [])
+            completed-span-count (atom nil)
             observed (apply-advice
                       (fn [_ respond _]
                         (swap! active-values conj (instrumentation/active?))
@@ -93,7 +94,12 @@
                         callback-result)
                       (fn [_] (throw (ex-info "unexpected raise" {})))
                       {instrumentation/route-option
-                       (fn [_] "/orders/:order-id")})
+                       (fn [_] "/orders/:order-id")
+                       instrumentation/on-end-option
+                       (fn []
+                         (swap! active-values conj (instrumentation/active?))
+                         (reset! completed-span-count
+                                 (count (memory/spans exporter))))})
             [span] (memory/spans exporter)
             attrs (:attributes span)]
         (is (identical? callback-result observed))
@@ -102,8 +108,10 @@
         (is (= remote-trace-id (get-in span [:span-context :trace-id])))
         (is (= remote-span-id (:parent-span-id span)))
         (is (= "blue" @baggage-value))
-        (is (= [true true] @active-values)
-            "the request-scoped marker covers dispatch and response completion")
+        (is (= [true true true] @active-values)
+            "the marker covers dispatch, response, and post-end completion")
+        (is (= 1 @completed-span-count)
+            "the completion hook observes the already-ended server span")
         (is (false? (instrumentation/active?))
             "the marker does not leak outside the request")
         (is (= "GET" (get attrs "http.request.method")))
@@ -113,6 +121,24 @@
         (is (= 201 (get attrs "http.response.status_code")))
         (is (not (.contains (pr-str span) "private response")))
         (is (not (.contains (pr-str span) "tenant=blue")))))))
+
+(deftest completion-hook-failure-cannot-change-the-http-result
+  (with-memory-sdk
+    (fn [exporter]
+      (let [callback-result (Object.)
+            observed
+            (apply-advice
+             (fn [_ respond _]
+               (respond {:status 204 :headers {} :body nil} false))
+             (request {:headers {}})
+             (fn [response _]
+               (observe-safe-response! response)
+               callback-result)
+             (fn [_] (throw (ex-info "unexpected raise" {})))
+             {instrumentation/on-end-option
+              (fn [] (throw (ex-info "observer failed" {})))})]
+        (is (identical? callback-result observed))
+        (is (= 1 (count (memory/spans exporter))))))))
 
 (deftest async-return-does-not-end-span-and-callback-restores-parent
   (with-memory-sdk

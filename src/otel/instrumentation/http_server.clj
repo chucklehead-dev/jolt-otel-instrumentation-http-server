@@ -54,6 +54,16 @@
   physical machine identity never reaches stored telemetry or screenshots."
   :otel.instrumentation.http-server/capture-network-addresses?)
 
+(def on-end-option
+  "jolt-http option naming a zero-argument completion hook. The provider calls
+  it exactly once after the accepted response callback has ended the server
+  span. Hook failures are observational and cannot change the HTTP result.
+  The ended span context remains installed during the hook, so hook-owned
+  telemetry/export work should use generic instrumentation suppression.
+  Embedded collectors can use it to flush the just-completed span before a
+  redirect causes the next viewer query."
+  :otel.instrumentation.http-server/on-end)
+
 (def ^:private known-methods
   ;; Stable HTTP semantic-convention values plus QUERY, which is already in the
   ;; current registry as a development value.
@@ -186,6 +196,12 @@
       (trace/set-attribute! span :error.type (str status))
       (trace/set-status! span :error))))
 
+(defn- notify-end! [opts]
+  (when-some [on-end (get opts on-end-option)]
+    (when (fn? on-end)
+      (try (on-end)
+           (catch :default _ nil)))))
+
 (defn- traced-handler [handler request opts]
   (let [{:keys [method span-name]} (method-values request)
         route        (resolved-route opts request)
@@ -224,7 +240,8 @@
                     (throw error))
                   (finally
                     (reset! ended? true)
-                    (trace/end! span)))))))]
+                    (trace/end! span)
+                    (notify-end! opts)))))))]
     (fn [_request respond raise]
       (let [respond (fn [response async?]
                       (terminal! #(respond response async?) (fn [] nil)))
