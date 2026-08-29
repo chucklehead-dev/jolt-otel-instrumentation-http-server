@@ -57,18 +57,23 @@
       (f exporter)
       (finally (sdk/shutdown! handle)))))
 
+(defn- apply-profile-advice
+  [advice handler request respond raise opts]
+  (let [args [handler request :socket :done :buffer :read-buffer opts :handled]
+        invoke (fn [xs]
+                 ((nth xs 0) (nth xs 1) respond raise))]
+    (advice
+     (join-point) args
+     (fn
+       ([] (invoke args))
+       ([replacement] (invoke replacement))))))
+
 (defn- apply-advice
   ([handler request respond raise]
    (apply-advice handler request respond raise {}))
   ([handler request respond raise opts]
-   (let [args [handler request :socket :done :buffer :read-buffer opts :handled]
-         invoke (fn [xs]
-                  ((nth xs 0) (nth xs 1) respond raise))]
-     (instrumentation/around
-      (join-point) args
-      (fn
-        ([] (invoke args))
-        ([replacement] (invoke replacement)))))))
+   (apply-profile-advice instrumentation/around
+                         handler request respond raise opts)))
 
 (deftest synchronous-response-preserves-result-and-remote-parent
   (with-memory-sdk
@@ -125,6 +130,85 @@
         (is (= 201 (get attrs "http.response.status_code")))
         (is (not (.contains (pr-str span) "private response")))
         (is (not (.contains (pr-str span) "tenant=blue")))))))
+
+(deftest build-selected-capture-profiles-are-bounded-and-explicit
+  (with-memory-sdk
+    (fn [exporter]
+      (let [req (request
+                 {:headers {"content-type" "application/json"
+                            "content-length" "20"
+                            "user-agent" "fixture-agent/1"
+                            "x-request-id" "request-42"
+                            "authorization" "Bearer request-secret"
+                            "cookie" "session=request-secret"}
+                  :body "{\"request\":\"body\"}"})
+            response {:status 200
+                      :headers {"Content-Type" "application/json"
+                                "Content-Length" "23"
+                                "X-Request-Id" "response-42"
+                                "Set-Cookie" "session=response-secret"}
+                      :body "{\"response\":\"details\"}"}
+            run! (fn [advice]
+                   (apply-profile-advice
+                    advice
+                    (fn [_ respond _] (respond response false))
+                    req
+                    (fn [safe _] (observe-safe-response! safe))
+                    (fn [_] nil)
+                    {}))]
+        (run! instrumentation/around)
+        (run! instrumentation/around-detailed)
+        (run! instrumentation/around-debug)
+        (let [[basic detailed debug] (memory/spans exporter)
+              basic-attrs (:attributes basic)
+              detailed-attrs (:attributes detailed)
+              debug-attrs (:attributes debug)]
+          (is (nil? (get basic-attrs "http.request.header.content-type")))
+          (is (nil? (get basic-attrs "http.request.body.size")))
+          (is (= ["application/json"]
+                 (get detailed-attrs "http.request.header.content-type")))
+          (is (= ["request-42"]
+                 (get detailed-attrs "http.request.header.x-request-id")))
+          (is (= ["application/json"]
+                 (get detailed-attrs "http.response.header.content-type")))
+          (is (= 20 (get detailed-attrs "http.request.body.size")))
+          (is (= 23 (get detailed-attrs "http.response.body.size")))
+          (is (= "fixture-agent/1"
+                 (get detailed-attrs "user_agent.original")))
+          (is (nil? (get detailed-attrs "http.request.body.content")))
+          (is (nil? (get detailed-attrs "http.response.body.content")))
+          (is (= "{\"request\":\"body\"}"
+                 (get debug-attrs "http.request.body.content")))
+          (is (= "{\"response\":\"details\"}"
+                 (get debug-attrs "http.response.body.content")))
+          (doseq [secret ["request-secret" "response-secret"]]
+            (is (not (.contains (pr-str [basic detailed debug]) secret)))))))))
+
+(deftest debug-body-capture-is-text-only-and-truncated
+  (with-memory-sdk
+    (fn [exporter]
+      (let [large (apply str (repeat 5000 "x"))
+            run! (fn [content-type body]
+                   (apply-profile-advice
+                    instrumentation/around-debug
+                    (fn [_ respond _]
+                      (respond {:status 200
+                                :headers {"content-type" content-type}
+                                :body body}
+                               false))
+                    (request {:headers {}})
+                    (fn [safe _] (observe-safe-response! safe))
+                    (fn [_] nil)
+                    {}))]
+        (run! "text/plain; charset=UTF-8" large)
+        (run! "application/octet-stream" "binary-secret")
+        (let [[text binary] (memory/spans exporter)]
+          (is (= 4096
+                 (count (get (:attributes text)
+                             "http.response.body.content"))))
+          (is (nil? (get (:attributes binary)
+                         "http.response.body.content")))
+          (is (not (.contains (pr-str binary) "binary-secret"))))))))
 
 (deftest completion-hook-failure-cannot-change-the-http-result
   (with-memory-sdk
@@ -580,3 +664,19 @@
            (get-in manifest [:aspects 0 :match])))
     (is (= {:entry 'jolt.http.protocol/sanitize-response :arity 1}
            (get-in manifest [:aspects 1 :match])))))
+
+(deftest package-owned-presets-select-the-versioned-provider-variants
+  (doseq [[profile provider]
+          [["basic" 'otel.instrumentation.http-server/basic-aspect-provider]
+           ["detailed" 'otel.instrumentation.http-server/detailed-aspect-provider]
+           ["debug" 'otel.instrumentation.http-server/debug-aspect-provider]]]
+    (let [resource-name
+          (str "META-INF/jolt/instrumentation/http-server/" profile ".edn")
+          resource (io/resource resource-name)
+          preset (some-> resource slurp edn/read-string)]
+      (is (some? resource))
+      (is (= 1 (:schema preset)))
+      (is (= (keyword "otel.http-server" profile) (:id preset)))
+      (is (= "META-INF/jolt/aspects/http-server.edn"
+             (get-in preset [:selections 0 :resource])))
+      (is (= provider (get-in preset [:selections 0 :provider]))))))

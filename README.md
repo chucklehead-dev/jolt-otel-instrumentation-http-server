@@ -4,6 +4,34 @@ Build-selected OpenTelemetry server instrumentation for jolt-http. jolt-http
 owns the inert `META-INF/jolt/aspects/http-server.edn` manifest; applications
 explicitly select this separate provider when building an executable.
 
+Applications using a preset-capable aspect compiler can select a package-owned
+capture policy without copying the manifest/provider wiring:
+
+```clojure
+{:jolt/build
+ {:aspects
+  [{:preset
+    "META-INF/jolt/instrumentation/http-server/basic.edn"}]}}
+```
+
+Three explicit presets ship in this package:
+
+| Preset | Captured span data |
+| --- | --- |
+| `basic` | Standard method, route/path, protocol, addresses, status, errors, propagation, and duration metric. No arbitrary headers, body sizes, or bodies. |
+| `detailed` | Basic plus bounded allowlisted content metadata, request IDs, user agent, and declared request/response body sizes. |
+| `debug` | Detailed plus up to 4096 characters of textual request/response body content when already available without consuming a stream. |
+
+`debug` is an explicit opt-in to potentially sensitive payload telemetry.
+Streaming request bodies are never read, repositioned, closed, or intercepted
+by this join point; consequently their content is absent. Authorization,
+proxy-authorization, cookie, set-cookie, API-key, Trace Context, tracestate, and
+baggage headers remain denied in every preset. Header values are bounded and
+must not contain line breaks.
+
+The emitted header, body-size, and body-content names follow the current
+[OpenTelemetry HTTP span semantic conventions](https://opentelemetry.io/docs/specs/semconv/http/http-spans/).
+
 ```clojure
 {:jolt/build
  {:aspects [{:resource "META-INF/jolt/aspects/http-server.edn"
@@ -112,6 +140,10 @@ env JOLT_GITLIBS_DIR=/home/chuck/.cache/jolt-http-server-gitlibs \
   -A:test build -m otel.instrumentation.http-server-build-smoke \
   -o target/http-server-build-smoke
 target/http-server-build-smoke
+
+env JOLT_BIN=/path/to/preset-capable/jolt \
+  JOLT_GITLIBS_DIR=/home/chuck/.cache/jolt-http-server-gitlibs \
+  test/preset_build_smoke.sh
 
 (cd test-app-plain && \
   env JOLT_GITLIBS_DIR=/home/chuck/.cache/jolt-http-server-gitlibs \

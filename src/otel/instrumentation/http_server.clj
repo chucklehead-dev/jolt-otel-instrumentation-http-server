@@ -28,9 +28,38 @@
   ::active-request)
 (def ^:private metric-attributes-context-key
   ::metric-attributes)
+(def ^:private capture-profile-context-key
+  ::capture-profile)
 (def ^:private duration-boundaries
   [0.005 0.01 0.025 0.05 0.075 0.1 0.25 0.5 0.75 1.0 2.5 5.0 7.5 10.0])
 (defonce ^:private duration-instrument-cache (atom nil))
+
+(def ^:private basic-capture
+  {:name :basic
+   :request-headers []
+   :response-headers []
+   :body-sizes? false
+   :bodies? false
+   :max-body-chars 0})
+
+(def ^:private detailed-capture
+  {:name :detailed
+   :request-headers ["content-length" "content-type" "user-agent"
+                     "x-request-id"]
+   :response-headers ["content-length" "content-type" "x-request-id"]
+   :body-sizes? true
+   :bodies? false
+   :max-body-chars 0})
+
+(def ^:private debug-capture
+  (assoc detailed-capture
+         :name :debug
+         :bodies? true
+         :max-body-chars 4096))
+
+(def ^:private sensitive-header-names
+  #{"authorization" "proxy-authorization" "cookie" "set-cookie"
+    "x-api-key" "traceparent" "tracestate" "baggage"})
 
 (defn active?
   "True while application code or a response callback runs inside this
@@ -149,6 +178,64 @@
                       (when (re-matches #"[0-9]+(?:\.[0-9]+)?" value) value))]
       version)))
 
+(defn- safe-header-value [value]
+  (when (and (string? value)
+             (<= (count value) 2048)
+             (not (re-find #"[\r\n]" value)))
+    value))
+
+(defn- normalized-headers [headers]
+  (reduce-kv
+   (fn [result name value]
+     (let [name (when (or (string? name) (keyword? name))
+                  (str/lower-case
+                   (if (keyword? name) (clojure.core/name name) name)))]
+       (if (and name (re-matches #"[!#$%&'*+.^_`|~0-9a-z-]+" name))
+         (assoc result name value)
+         result)))
+   {}
+   (if (map? headers) headers {})))
+
+(defn- captured-header-attributes [kind headers names]
+  (let [headers (normalized-headers headers)]
+    (reduce
+     (fn [attrs name]
+       (if (contains? sensitive-header-names name)
+         attrs
+         (if-some [value (safe-header-value (get headers name))]
+           (assoc attrs (str "http." kind ".header." name) [value])
+           attrs)))
+     {}
+     names)))
+
+(defn- content-length [headers]
+  (let [raw (get (normalized-headers headers) "content-length")]
+    (when (string? raw)
+      (try
+        (let [n (parse-long raw)]
+          (when (and n (not (neg? n))) n))
+        (catch :default _ nil)))))
+
+(defn- textual-content? [headers]
+  (when-some [content-type
+              (some-> (get (normalized-headers headers) "content-type")
+                      str/lower-case
+                      (str/split #";" 2)
+                      first
+                      str/trim)]
+    (or (str/starts-with? content-type "text/")
+        (str/ends-with? content-type "/json")
+        (str/ends-with? content-type "+json")
+        (str/ends-with? content-type "/xml")
+        (str/ends-with? content-type "+xml")
+        (str/ends-with? content-type "/yaml")
+        (str/ends-with? content-type "+yaml")
+        (= content-type "application/x-www-form-urlencoded"))))
+
+(defn- bounded-body [body headers {:keys [bodies? max-body-chars]}]
+  (when (and bodies? (string? body) (textual-content? headers))
+    (subs body 0 (min (count body) max-body-chars))))
+
 (defn- resolved-route [opts request]
   (when-some [resolve-route (get opts route-option)]
     (when (fn? resolve-route)
@@ -165,7 +252,7 @@
            (catch :default _ true))
       true)))
 
-(defn- request-attributes [request method route capture-addresses?]
+(defn- request-attributes [request method route capture-addresses? capture]
   (let [scheme (safe-scheme (:scheme request))
         path (safe-path (:uri request))
         protocol (safe-protocol-version (:protocol request))
@@ -176,8 +263,16 @@
         server-port (when (and capture-addresses?
                                (integer? (:server-port request))
                                (<= 1 (:server-port request) 65535))
-                      (:server-port request))]
-    (cond-> {:http.request.method method}
+                      (:server-port request))
+        headers (:headers request)
+        user-agent (when (not= :basic (:name capture))
+                     (safe-header-value
+                      (get (normalized-headers headers) "user-agent")))
+        body-size (when (:body-sizes? capture) (content-length headers))
+        body-content (bounded-body (:body request) headers capture)]
+    (cond-> (merge {:http.request.method method}
+                   (captured-header-attributes
+                    "request" headers (:request-headers capture)))
     route
     (assoc :http.route route)
 
@@ -200,7 +295,16 @@
     (assoc :client.address client-address
            ;; jolt-http exposes the connected peer, not a proxy-derived
            ;; original address, so these are intentionally equal here.
-           :network.peer.address client-address))))
+           :network.peer.address client-address)
+
+    user-agent
+    (assoc :user_agent.original user-agent)
+
+    body-size
+    (assoc :http.request.body.size body-size)
+
+    body-content
+    (assoc :http.request.body.content body-content))))
 
 (defn- exception-type [error]
   (try
@@ -249,7 +353,7 @@
   (let [status (:status response)]
     (when (integer? status) status)))
 
-(defn- mark-response! [span metric-attrs response]
+(defn- mark-response! [span metric-attrs response capture]
   (when-some [status (response-status response)]
     (if (<= 100 status 599)
       (do
@@ -262,7 +366,16 @@
       (do
         (trace/set-attribute! span :error.type "_OTHER")
         (swap! metric-attrs assoc :error.type "_OTHER")
-        (trace/set-status! span :error)))))
+        (trace/set-status! span :error))))
+  (let [headers (:headers response)
+        body-size (when (:body-sizes? capture) (content-length headers))
+        body-content (bounded-body (:body response) headers capture)]
+    (trace/set-attributes!
+     span
+     (cond-> (captured-header-attributes
+              "response" headers (:response-headers capture))
+       body-size (assoc :http.response.body.size body-size)
+       body-content (assoc :http.response.body.content body-content)))))
 
 (defn- notify-end! [opts]
   (when-some [on-end (get opts on-end-option)]
@@ -281,13 +394,14 @@
         (catch :default _ context/root))
       context/root)))
 
-(defn- traced-handler [handler request opts]
+(defn- traced-handler [handler request opts capture]
   (let [{:keys [method span-name]} (method-values request)
         route        (resolved-route opts request)
         capture-addresses? (not (false? (get opts network-addresses-option)))
         span-name    (if route (str span-name " " route) span-name)
         parent       (extracted-parent opts (or (:headers request) {}))
-        attributes   (request-attributes request method route capture-addresses?)
+        attributes   (request-attributes request method route capture-addresses?
+                                         capture)
         metric-attrs (atom (metric-attributes attributes))
         started      (host/mono-nanos)
         start-wall   (host/wall-nanos)
@@ -301,7 +415,8 @@
                          (trace/context-with-span span)
                          (context/with-value active-context-key true)
                          (context/with-value metric-attributes-context-key
-                                             metric-attrs))
+                                             metric-attrs)
+                         (context/with-value capture-profile-context-key capture))
         ended?       (atom false)
         terminal-lock (Object.)
         terminal!
@@ -342,6 +457,15 @@
             (catch :default error
               (terminal! #(throw error) (fn [] nil)))))))))
 
+(defn- around-with-profile
+  [capture _join-point
+   [handler request socket done buffer read-buffer opts handled] proceed]
+  (if (or (context/instrumentation-suppressed?)
+          (excluded? opts request))
+    (proceed)
+    (proceed [(traced-handler handler request opts capture)
+              request socket done buffer read-buffer opts handled])))
+
 (defn around
   "Instrument the compiler's fixed-arity `invoke-handler` entry.
 
@@ -350,11 +474,22 @@
   application result or exception remain owned by jolt-http. Generic
   instrumentation suppression bypasses extraction and all telemetry work."
   [_join-point [handler request socket done buffer read-buffer opts handled] proceed]
-  (if (or (context/instrumentation-suppressed?)
-          (excluded? opts request))
-    (proceed)
-    (proceed [(traced-handler handler request opts)
-              request socket done buffer read-buffer opts handled])))
+  (around-with-profile basic-capture _join-point
+                       [handler request socket done buffer read-buffer opts handled]
+                       proceed))
+
+(defn around-detailed
+  "Detailed server advice with explicit bounded header and body-size capture."
+  [join-point args proceed]
+  (around-with-profile detailed-capture join-point args proceed))
+
+(defn around-debug
+  "Debug server advice with bounded textual body content capture in addition to
+  the detailed profile. Selecting this provider is an explicit opt-in to
+  potentially sensitive payload telemetry. Streaming request bodies remain
+  untouched and therefore cannot be captured at this join point."
+  [join-point args proceed]
+  (around-with-profile debug-capture join-point args proceed))
 
 (defn around-response
   "Observe the result of jolt-http response sanitization while the server span
@@ -370,10 +505,13 @@
       (when-some [metric-attrs (context/get-value
                                 (context/current)
                                 metric-attributes-context-key)]
-        (mark-response! (trace/current-span) metric-attrs (first result))))
+        (mark-response! (trace/current-span) metric-attrs (first result)
+                        (or (context/get-value (context/current)
+                                               capture-profile-context-key)
+                            basic-capture))))
     result))
 
-(def aspect-provider
+(def basic-aspect-provider
   {:schema 1
    :libraries {'casselc/jolt-http http-build-id}
    :roles {:http/server {:fn 'otel.instrumentation.http-server/around
@@ -381,3 +519,27 @@
            :http/server-response
            {:fn 'otel.instrumentation.http-server/around-response
             :contract :args-v1}}})
+
+(def detailed-aspect-provider
+  {:schema 1
+   :libraries {'casselc/jolt-http http-build-id}
+   :roles {:http/server
+           {:fn 'otel.instrumentation.http-server/around-detailed
+            :contract :replace-args-v1}
+           :http/server-response
+           {:fn 'otel.instrumentation.http-server/around-response
+            :contract :args-v1}}})
+
+(def debug-aspect-provider
+  {:schema 1
+   :libraries {'casselc/jolt-http http-build-id}
+   :roles {:http/server
+           {:fn 'otel.instrumentation.http-server/around-debug
+            :contract :replace-args-v1}
+           :http/server-response
+           {:fn 'otel.instrumentation.http-server/around-response
+            :contract :args-v1}}})
+
+(def aspect-provider
+  "Compatibility default. Equivalent to the basic preset/provider."
+  basic-aspect-provider)
