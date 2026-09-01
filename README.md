@@ -4,8 +4,16 @@ Build-selected OpenTelemetry server instrumentation for jolt-http. jolt-http
 owns the inert `META-INF/jolt/aspects/http-server.edn` manifest; applications
 explicitly select this separate provider when building an executable.
 
-Applications using a preset-capable aspect compiler can select a package-owned
-capture policy without copying the manifest/provider wiring:
+The source and unit-test surface requires Jolt 0.8.0 or newer. Compiler-woven
+builds additionally require an explicitly selected aspect-capable compiler;
+the released Jolt 0.8.0 remains the plain/unit compatibility floor.
+
+Preset selection is staged but not yet an end-to-end validated public path.
+It requires a compiler that combines Jolt 0.8 runtime semantics with package
+preset expansion; those capabilities currently exist on separate development
+lines. `test/preset_build_smoke.sh` fails fast until a compiler supplies both.
+Once consolidated, applications can select a package-owned capture policy
+without copying the manifest/provider wiring:
 
 ```clojure
 {:jolt/build
@@ -46,6 +54,11 @@ callback finishes the span after jolt-http processes it; duplicate callbacks do
 not finish it twice. A companion response seam observes jolt-http's sanitized
 response, so invalid handler metadata replaced by a safe 500 is reported as the
 actual accepted 500 rather than the handler's rejected value.
+
+Terminal log emission, span completion, duration recording, and the optional
+completion hook are independent fail-open observations. A failure in any one
+cannot replace a successful Ring callback result, mask the original object
+thrown by application code, or prevent the remaining terminal observations.
 
 The lifecycle deliberately means **Ring response callback completed**. It does
 not mean that the kernel flushed the final write or that the peer received it.
@@ -135,13 +148,16 @@ does not select it; only its explicit child span is exported.
 env JOLT_GITLIBS_DIR=/home/chuck/.cache/jolt-http-server-gitlibs \
   /home/chuck/ai-src/tools/jolt-with-chez-10.4.1 jolt -M:test
 
-env JOLT_GITLIBS_DIR=/home/chuck/.cache/jolt-http-server-gitlibs \
-  /home/chuck/ai-src/tools/jolt-with-chez-10.4.1 jolt \
+env JOLT_BIN=/path/to/aspect-capable/jolt \
+  JOLT_GITLIBS_DIR=/home/chuck/.cache/jolt-http-server-gitlibs \
+  /home/chuck/ai-src/tools/jolt-with-chez-10.4.1 "$JOLT_BIN" \
   -A:test build -m otel.instrumentation.http-server-build-smoke \
   -o target/http-server-build-smoke
 target/http-server-build-smoke
 
-env JOLT_BIN=/path/to/preset-capable/jolt \
+# Staged: this intentionally fails unless the compiler has both Jolt 0.8
+# runtime semantics and package preset expansion.
+env JOLT_BIN=/path/to/consolidated-preset-capable-jolt \
   JOLT_GITLIBS_DIR=/home/chuck/.cache/jolt-http-server-gitlibs \
   test/preset_build_smoke.sh
 

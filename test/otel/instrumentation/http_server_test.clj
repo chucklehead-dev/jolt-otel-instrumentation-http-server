@@ -6,6 +6,8 @@
             [otel.context :as context]
             [otel.exporter.memory :as memory]
             [otel.instrumentation.http-server :as instrumentation]
+            [otel.logs :as logs]
+            [otel.metrics :as metrics]
             [otel.propagation :as propagation]
             [otel.sdk :as sdk]
             [otel.trace :as trace]))
@@ -423,6 +425,126 @@
         (doseq [secret ["private raised message" "private thrown message"]]
           (is (not (.contains (pr-str [spans (memory/records exporter)])
                               secret))))))))
+
+(deftest exception-log-failure-preserves-the-original-thrown-object
+  (with-memory-sdk
+    (fn [exporter]
+      (let [thrown (ex-info "application failure" {:owner :application})
+            log-failure (ex-info "log exporter failure" {:owner :telemetry})
+            observed
+            (with-redefs [logs/emit! (fn [& _] (throw log-failure))]
+              (try
+                (apply-advice
+                 (fn [_ _ _] (throw thrown))
+                 (request {:headers {}})
+                 (fn [_ _] nil)
+                 (fn [_] nil))
+                (catch :default error error)))
+            [span] (memory/spans exporter)]
+        (is (identical? thrown observed))
+        (is (= :error (get-in span [:status :code])))
+        (is (some? (get (:attributes span) "error.type")))))))
+
+(deftest span-end-failure-preserves-application-control-and-attempts-the-metric
+  (with-memory-sdk
+    (fn [exporter]
+      (let [callback-result (Object.)
+            thrown (ex-info "application failure" {:owner :application})
+            end-failure (ex-info "span processor failure" {})
+            metric-calls (atom 0)
+            record! metrics/record!
+            [observed-result observed-throw]
+            (with-redefs [trace/end! (fn [& _] (throw end-failure))
+                          metrics/record! (fn [& args]
+                                            (swap! metric-calls inc)
+                                            (apply record! args))]
+              [(apply-advice
+                (fn [_ respond _]
+                  (respond {:status 204 :headers {} :body nil} false))
+                (request {:headers {}})
+                (fn [response _]
+                  (observe-safe-response! response)
+                  callback-result)
+                (fn [_] nil))
+               (try
+                 (apply-advice
+                  (fn [_ _ _] (throw thrown))
+                  (request {:headers {}})
+                  (fn [_ _] nil)
+                  (fn [_] nil))
+                 (catch :default error error))])]
+        (is (identical? callback-result observed-result))
+        (is (identical? thrown observed-throw))
+        (is (= 2 @metric-calls))
+        (is (empty? (memory/spans exporter)))))))
+
+(deftest duration-metric-failure-preserves-application-control-and-ended-spans
+  (with-memory-sdk
+    (fn [exporter]
+      (let [callback-result (Object.)
+            thrown (ex-info "application failure" {:owner :application})
+            metric-failure (ex-info "metric exporter failure" {})
+            [observed-result observed-throw]
+            (with-redefs [metrics/record! (fn [& _] (throw metric-failure))]
+              [(apply-advice
+                (fn [_ respond _]
+                  (respond {:status 202 :headers {} :body nil} false))
+                (request {:headers {}})
+                (fn [response _]
+                  (observe-safe-response! response)
+                  callback-result)
+                (fn [_] nil))
+               (try
+                 (apply-advice
+                  (fn [_ _ _] (throw thrown))
+                  (request {:headers {}})
+                  (fn [_ _] nil)
+                  (fn [_] nil))
+                 (catch :default error error))])]
+        (is (identical? callback-result observed-result))
+        (is (identical? thrown observed-throw))
+        (let [[success-span error-span] (memory/spans exporter)]
+          (is (= 202 (get (:attributes success-span)
+                          "http.response.status_code")))
+          (is (= :error (get-in error-span [:status :code]))))))))
+
+(deftest response-annotation-failure-preserves-result-and-terminal-observations
+  (with-memory-sdk
+    (fn [exporter]
+      (let [response {:status 206 :headers {} :body nil}
+            sanitized-result [response nil]
+            callback-result (Object.)
+            annotation-failure (ex-info "response annotation failure" {})
+            observed-sanitized (atom nil)
+            end-calls (atom 0)
+            metric-calls (atom 0)
+            end! trace/end!
+            record! metrics/record!
+            observed-result
+            (with-redefs
+              [trace/set-attributes! (fn [& _] (throw annotation-failure))
+               trace/end! (fn [& args]
+                            (swap! end-calls inc)
+                            (apply end! args))
+               metrics/record! (fn [& args]
+                                  (swap! metric-calls inc)
+                                  (apply record! args))]
+              (apply-advice
+               (fn [_ respond _] (respond response false))
+               (request {:headers {}})
+               (fn [_ _]
+                 (reset!
+                  observed-sanitized
+                  (instrumentation/around-response
+                   (response-join-point) [response]
+                   (fn [] sanitized-result)))
+                 callback-result)
+               (fn [_] nil)))]
+        (is (identical? callback-result observed-result))
+        (is (identical? sanitized-result @observed-sanitized))
+        (is (= 1 @end-calls))
+        (is (= 1 @metric-calls))
+        (is (= 1 (count (memory/spans exporter))))))))
 
 (deftest exception-error-type-agrees-across-span-log-and-duration-metric
   (let [exporter (memory/multisignal-exporter)

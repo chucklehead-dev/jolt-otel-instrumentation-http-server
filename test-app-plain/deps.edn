@@ -1,4 +1,6 @@
 {:paths ["../test"]
 
+ :jolt/min-version "0.8.0"
+
  :deps {io.github.chucklehead-dev/jolt-otel-instrumentation-http-server
         {:local/root ".."}}}

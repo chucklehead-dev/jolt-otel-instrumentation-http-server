@@ -335,19 +335,29 @@
                [:http.request.method :url.scheme :http.route
                 :network.protocol.version]))
 
+(defn- observe!
+  "Run one observational operation without letting it replace application
+  control flow. Terminal operations are deliberately isolated from one another
+  so a failed exporter or processor cannot prevent the remaining cleanup."
+  [operation]
+  (try
+    (operation)
+    (catch :default _ nil)))
+
 (defn- mark-error! [span metric-attrs error]
   (let [error-type (exception-type error)]
-    (trace/set-attribute! span :error.type error-type)
-    (swap! metric-attrs assoc :error.type error-type)
+    (observe! #(trace/set-attribute! span :error.type error-type))
+    (observe! #(swap! metric-attrs assoc :error.type error-type))
     ;; Exception messages, stack traces, and ex-data routinely contain request
     ;; bodies, credentials, filesystem paths, and application data. The type
     ;; alone satisfies the event contract without weakening privacy defaults.
-    (logs/emit! (sdk/logger scope-name {:version instrumentation-version})
-                {:event-name "http.server.request.exception"
-                 :body "HTTP server request exception"
-                 :severity :error
-                 :attributes {:exception.type error-type}})
-    (trace/set-status! span :error)))
+    (observe!
+     #(logs/emit! (sdk/logger scope-name {:version instrumentation-version})
+                  {:event-name "http.server.request.exception"
+                   :body "HTTP server request exception"
+                   :severity :error
+                   :attributes {:exception.type error-type}}))
+    (observe! #(trace/set-status! span :error))))
 
 (defn- response-status [response]
   (let [status (:status response)]
@@ -432,7 +442,7 @@
               (context/with-context span-context
                 (try
                   (let [result (operation)]
-                    (success!)
+                    (observe! success!)
                     result)
                   (catch :default error
                     (mark-error! span metric-attrs error)
@@ -440,10 +450,10 @@
                   (finally
                     (let [elapsed (- (host/mono-nanos) started)]
                       (reset! ended? true)
-                      (trace/end! span (+ start-wall elapsed))
-                      (metrics/record! (duration-instrument)
-                                       (/ elapsed 1000000000.0)
-                                       @metric-attrs))
+                      (observe! #(trace/end! span (+ start-wall elapsed)))
+                      (observe! #(metrics/record! (duration-instrument)
+                                                  (/ elapsed 1000000000.0)
+                                                  @metric-attrs)))
                     (notify-end! opts)))))))]
     (fn [_request respond raise]
       (let [respond (fn [response async?]
@@ -505,10 +515,11 @@
       (when-some [metric-attrs (context/get-value
                                 (context/current)
                                 metric-attributes-context-key)]
-        (mark-response! (trace/current-span) metric-attrs (first result)
-                        (or (context/get-value (context/current)
-                                               capture-profile-context-key)
-                            basic-capture))))
+        (observe!
+         #(mark-response! (trace/current-span) metric-attrs (first result)
+                          (or (context/get-value (context/current)
+                                                 capture-profile-context-key)
+                              basic-capture)))))
     result))
 
 (def basic-aspect-provider
