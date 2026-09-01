@@ -573,10 +573,16 @@
                     {:fn 'otel.instrumentation.http-server/around-response
                      :contract :args-v1}}}
            instrumentation/aspect-provider))
-    (is (= 'casselc/jolt-http (get-in manifest [:library :id])))
-    (is (= instrumentation/http-build-id
-           (get-in manifest [:library :version])))
-    (is (= {:entry 'jolt.http.protocol/invoke-handler :arity 8}
-           (get-in manifest [:aspects 0 :match])))
-    (is (= {:entry 'jolt.http.protocol/sanitize-response :arity 1}
-           (get-in manifest [:aspects 1 :match])))))
+    (is (= {:schema 1
+            :library {:id 'casselc/jolt-http
+                      :version instrumentation/http-build-id}
+            :aspects
+            [{:id :http/server-ring-handler
+              :match {:entry 'jolt.http.protocol/invoke-handler :arity 8}
+              :advice-role :http/server
+              :expect {:matches 1}}
+             {:id :http/server-sanitized-response
+              :match {:entry 'jolt.http.protocol/sanitize-response :arity 1}
+              :advice-role :http/server-response
+              :expect {:matches 1}}]}
+           manifest))))

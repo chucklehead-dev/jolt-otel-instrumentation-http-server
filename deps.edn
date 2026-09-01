@@ -1,8 +1,10 @@
 {:paths ["src"]
 
+ :jolt/min-version "0.8.0"
+
  :deps {io.github.casselc/jolt-http
         {:git/url "https://github.com/casselc/jolt-http.git"
-         :git/sha "c6effc3a04be1467e66da433b879a8a73a352228"}
+         :git/sha "d9fa89309fb9faa3dd3e8319a79d57fc03925341"}
         io.github.casselc/otel
         {:git/url "https://github.com/casselc/otel.git"
          :git/sha "a9badb98a86d4e0aa207aa0609da03dc8e4c087f"}}
