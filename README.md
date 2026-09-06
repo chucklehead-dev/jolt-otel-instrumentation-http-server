@@ -8,12 +8,12 @@ The source and unit-test surface requires Jolt 0.8.0 or newer. Compiler-woven
 builds additionally require an explicitly selected aspect-capable compiler;
 the released Jolt 0.8.0 remains the plain/unit compatibility floor.
 
-Preset selection is staged but not yet an end-to-end validated public path.
-It requires a compiler that combines Jolt 0.8 runtime semantics with package
-preset expansion; those capabilities currently exist on separate development
-lines. `test/preset_build_smoke.sh` fails fast until a compiler supplies both.
-Once consolidated, applications can select a package-owned capture policy
-without copying the manifest/provider wiring:
+Preset selection is validated end to end with the exact aspect compiler
+`523c8d89929e9867563faa48d863c4df05a0d849`. The repository gate expands,
+builds, and runs all three package presets; a separate build keeps the provider
+and inert manifest on the classpath without selecting either and proves that
+the plain application remains uninstrumented. Applications can therefore
+select a package-owned capture policy without copying manifest/provider wiring:
 
 ```clojure
 {:jolt/build
@@ -136,35 +136,47 @@ status telemetry:
   :otel.instrumentation.http-server/capture-network-addresses? false)
 ```
 
-## WIP verification
+## Verification
 
 Run the unit gate, then build and execute both sides of the opt-in contract
 with the aspect-enabled compiler. The woven fixture proves remote parentage,
 async child context, accepted status, and delayed completion over real loopback
 HTTP. The plain fixture has the provider and inert manifest on its classpath but
-does not select it; only its explicit child span is exported.
+does not select it; only its explicit child span is exported. Jolt derives the
+compiler version from Git tags, so reproduce the CI tag mapping before building
+the exact compiler checkout:
 
 ```sh
-env JOLT_GITLIBS_DIR=/home/chuck/.cache/jolt-http-server-gitlibs \
-  /home/chuck/ai-src/tools/jolt-with-chez-10.4.1 jolt -M:test
+JOLT_COMPILER=/absolute/path/to/jolt-523c8d89929e
+JOLT_TOOLCHAIN=/home/chuck/ai-src/tools/jolt-with-chez-10.4.1
+JOLT_GITLIBS_DIR=/home/chuck/.cache/jolt-http-server-gitlibs
+export JOLT_COMPILER JOLT_TOOLCHAIN JOLT_GITLIBS_DIR
 
-env JOLT_BIN=/path/to/aspect-capable/jolt \
-  JOLT_GITLIBS_DIR=/home/chuck/.cache/jolt-http-server-gitlibs \
-  /home/chuck/ai-src/tools/jolt-with-chez-10.4.1 "$JOLT_BIN" \
-  -A:test build -m otel.instrumentation.http-server-build-smoke \
+(cd "$JOLT_COMPILER" && \
+  test "$(git rev-parse HEAD)" = \
+    "523c8d89929e9867563faa48d863c4df05a0d849" && \
+  test "$(git rev-parse 9b7683953b444ece2a2e783e8fa46d31177bb476^{tree})" = \
+    "1179a2730c7098b1cc65ec6becdc36309d87d55e" && \
+  git tag --force v0.8.1 9b7683953b444ece2a2e783e8fa46d31177bb476 && \
+  "$JOLT_TOOLCHAIN" make -j1 jolt-release)
+
+JOLT_BIN=$JOLT_COMPILER/target/release/jolt
+export JOLT_BIN
+
+test "$("$JOLT_TOOLCHAIN" "$JOLT_BIN" --version)" = \
+  "jolt v0.8.1-30-g523c8d89"
+"$JOLT_TOOLCHAIN" "$JOLT_BIN" -M:test
+
+"$JOLT_TOOLCHAIN" "$JOLT_BIN" -A:test build \
+  -m otel.instrumentation.http-server-build-smoke \
   -o target/http-server-build-smoke
 target/http-server-build-smoke
 
-# Staged: this intentionally fails unless the compiler has both Jolt 0.8
-# runtime semantics and package preset expansion.
-env JOLT_BIN=/path/to/consolidated-preset-capable-jolt \
-  JOLT_GITLIBS_DIR=/home/chuck/.cache/jolt-http-server-gitlibs \
-  test/preset_build_smoke.sh
+test/preset_build_smoke.sh
 
 (cd test-app-plain && \
-  env JOLT_GITLIBS_DIR=/home/chuck/.cache/jolt-http-server-gitlibs \
-  /home/chuck/ai-src/tools/jolt-with-chez-10.4.1 jolt \
-  build -m otel.instrumentation.http-server-build-smoke \
+  "$JOLT_TOOLCHAIN" "$JOLT_BIN" build \
+    -m otel.instrumentation.http-server-build-smoke \
     -o target/plain-http-server-smoke)
 test-app-plain/target/plain-http-server-smoke plain
 ```
