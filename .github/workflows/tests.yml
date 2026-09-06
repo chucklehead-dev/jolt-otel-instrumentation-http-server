@@ -31,3 +31,83 @@ jobs:
         run: test "$(jolt --version)" = "jolt v0.8.0"
       - name: Test
         run: jolt -Srepro -M:test
+
+  preset-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      JOLT_CACHE_DIR: ${{ github.workspace }}/.jolt-cache-523c8d89
+      JOLT_GITLIBS_DIR: ${{ github.workspace }}/.jolt-gitlibs-523c8d89
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the pinned aspect compiler
+        uses: actions/checkout@v5
+        with:
+          repository: casselc/jolt
+          ref: 523c8d89929e9867563faa48d863c4df05a0d849
+          path: .jolt-compiler
+          submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Verify the compiler tree
+        working-directory: .jolt-compiler
+        run: |
+          test "$(git rev-parse HEAD)" = "523c8d89929e9867563faa48d863c4df05a0d849"
+          test "$(git rev-parse 9b7683953b444ece2a2e783e8fa46d31177bb476^{tree})" = \
+            "1179a2730c7098b1cc65ec6becdc36309d87d55e"
+          git merge-base --is-ancestor 9b7683953b444ece2a2e783e8fa46d31177bb476 HEAD
+          git tag --force v0.8.1 9b7683953b444ece2a2e783e8fa46d31177bb476
+          test "$(git describe --tags --long HEAD)" = "v0.8.1-30-g523c8d89"
+
+      - name: Install compiler build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git liblz4-dev zlib1g-dev libncurses-dev uuid-dev
+
+      - name: Cache Chez Scheme 10.4.1
+        id: cache-chez
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/chez
+          key: chez-${{ runner.os }}-${{ env.ImageOS }}-v10.4.1-x11off
+
+      - name: Build Chez Scheme 10.4.1
+        if: steps.cache-chez.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v10.4.1 https://github.com/cisco/ChezScheme.git /tmp/chez-src
+          cd /tmp/chez-src
+          ./configure --installprefix="$RUNNER_TEMP/chez" --threads --disable-x11
+          make -j"$(nproc)"
+          make install
+
+      - name: Put Chez Scheme 10.4.1 on PATH
+        run: |
+          printf '#!/bin/sh\nexec "%s/bin/scheme" "$@"\n' "$RUNNER_TEMP/chez" > "$RUNNER_TEMP/chez/bin/chez"
+          chmod +x "$RUNNER_TEMP/chez/bin/chez"
+          echo "$RUNNER_TEMP/chez/bin" >> "$GITHUB_PATH"
+          test "$("$RUNNER_TEMP/chez/bin/chez" --version)" = "10.4.1"
+
+      - name: Build the pinned aspect compiler
+        working-directory: .jolt-compiler
+        run: |
+          make CHEZ="$RUNNER_TEMP/chez/bin/chez" -j1 jolt-release
+          echo "$GITHUB_WORKSPACE/.jolt-compiler/target/release" >> "$GITHUB_PATH"
+
+      - name: Assert Jolt version
+        run: test "$(jolt --version)" = "jolt v0.8.1-30-g523c8d89"
+
+      - name: Verify all package presets
+        env:
+          JOLT_BIN: ${{ github.workspace }}/.jolt-compiler/target/release/jolt
+        run: test/preset_build_smoke.sh
+
+      - name: Verify the unselected application remains plain
+        working-directory: test-app-plain
+        run: |
+          jolt build -m otel.instrumentation.http-server-build-smoke \
+            -o target/plain-http-server-smoke
+          output=$(target/plain-http-server-smoke plain)
+          printf '%s\n' "$output"
+          grep -Fqx 'OK: plain HTTP server manifest remains inert' <<<"$output"
